@@ -433,6 +433,7 @@ class MultiSliderClass(object):
                  slider_maxs   = None,
                  slider_vals   = None,
                  resolution    = 0.1,
+                 ADD_PLAYBACK  = False,
                  VERBOSE       = True
         ):
         """
@@ -485,10 +486,36 @@ class MultiSliderClass(object):
         
         # Create sliders
         self.sliders = self.create_sliders()
+        self.n_slider = len(self.sliders)
+        
+        # Add button for playback
+        self.ADD_PLAYBACK = ADD_PLAYBACK
+        if self.ADD_PLAYBACK:
+            self.button_playback = tk.Button(self.gui,text="PLAY", command=self.cb_playback)
+            self.button_playback.pack(pady=15)
+            self.PLAYBACK = False
         
         # Update the canvas scroll region when the sliders_frame changes size
         self.sliders_frame.bind("<Configure>",self.cb_scroll)
         
+    def reset_playback(self):
+        self.PLAYBACK = False
+        self.button_playback.config(text="PLAY")
+        
+    def cb_playback(self):
+        """ 
+            Button callback
+        """
+        if self.PLAYBACK:
+            self.PLAYBACK = False
+        else:
+            self.PLAYBACK = True
+        
+        if self.PLAYBACK:
+            self.button_playback.config(text="STOP")
+        else:
+            self.button_playback.config(text="PLAY")
+    
     def cb_scroll(self,event):    
         self.canvas.configure(scrollregion=self.canvas.bbox("all"))
         
@@ -551,6 +578,10 @@ class MultiSliderClass(object):
         
     def get_slider_values(self):
         return self.slider_values
+    
+    def set_slider_values(self,slider_values):
+        for s_idx in range(self.n_slider):
+            self.sliders[s_idx].set(slider_values[s_idx])
     
     def close(self):
         if self.is_window_exists():
