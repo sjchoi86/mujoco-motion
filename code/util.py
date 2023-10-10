@@ -2,6 +2,7 @@ import math,time,os
 import numpy as np
 import tkinter as tk
 import shapely as sp # handle polygon
+import mediapy as media
 from shapely import Polygon,LineString,Point # handle polygons
 from scipy.spatial.distance import cdist
 
@@ -226,7 +227,11 @@ def kernel_se(X1,X2,hyp={'g':1,'l':1}):
     """
         Squared exponential (SE) kernel function
     """
-    K = hyp['g']*np.exp(-cdist(X1,X2,'sqeuclidean')/(2*hyp['l']*hyp['l']))
+    if len(X1.shape) == 1: X1_in = X1.reshape((-1,1))
+    else: X1_in = X1.copy()
+    if len(X2.shape) == 1: X2_in = X2.reshape((-1,1))
+    else: X2_in = X2.copy()
+    K = hyp['g']*np.exp(-cdist(X1_in,X2_in,'sqeuclidean')/(2*hyp['l']*hyp['l']))
     return K
 
 def kernel_levse(X1,X2,L1,L2,hyp={'g':1,'l':1}):
@@ -498,6 +503,11 @@ class MultiSliderClass(object):
         # Update the canvas scroll region when the sliders_frame changes size
         self.sliders_frame.bind("<Configure>",self.cb_scroll)
         
+        # Dummy-run to avoid some errors
+        for _ in range(100): 
+            self.update()
+            time.sleep(1e-6)
+        
     def reset_playback(self):
         self.PLAYBACK = False
         self.button_playback.config(text="PLAY")
@@ -580,12 +590,334 @@ class MultiSliderClass(object):
         return self.slider_values
     
     def set_slider_values(self,slider_values):
+        """ 
+            Set slider values
+        """
         for s_idx in range(self.n_slider):
-            self.sliders[s_idx].set(slider_values[s_idx])
+            if self.sliders[s_idx].get() == slider_values[s_idx]:
+                DO_NOTHING = True
+            else:
+                self.sliders[s_idx].set(slider_values[s_idx])
     
     def close(self):
+        """ 
+            Close GUI
+        """
         if self.is_window_exists():
             self.gui.destroy()
-            self.gui.quit()
-            self.gui.update()
+        else:
+            print ("Window does not exist.")
+
+def animiate_motion_with_slider(
+    env,tick_slider,
+    q_list,p_root_list,quat_root_list,rev_joint_names,
+    PLAY_AT_START=True,
+    FONTSCALE_VALUE=200):
+    """
+        Animate motion with slider control
+    """
+    # Get useful indices
+    joint_idxs_fwd = env.get_idxs_fwd(joint_names=rev_joint_names)
+    
+    # Initialize slider
+    L = q_list.shape[0]
+    tick_slider.sliders[0].config(to=L)
+    tick_slider.sliders[0].set(0)
+    tick_slider.update()
+    time.sleep(1e-1) # little delay helps
+    
+    # Tick slider 
+    if PLAY_AT_START:
+        tick_slider.PLAYBACK = True
+    
+    # Initialize viewer
+    env.init_viewer(viewer_title='Common Rig',viewer_width=1200,viewer_height=800,
+                    viewer_hide_menus=True,FONTSCALE_VALUE=FONTSCALE_VALUE)
+    env.update_viewer(azimuth=152,distance=3.0,elevation=-30,lookat=[0.02,-0.03,0.8])
+    env.reset()
+    tick = 0
+    while env.is_viewer_alive():
+        # Update 
+        time.sleep(1e-10) # little delay helps
+        tick_slider.update()
+        if tick_slider.PLAYBACK: # play mode
+            tick = min(tick+1,L-1)
+            if tick == (L-1): tick_slider.reset_playback()
+            tick_slider.set_slider_values([tick])
+        else: # stop mode
+            slider_val = tick_slider.get_slider_values()
+            tick = int(slider_val[0])
+        # Trim tick
+        if tick < 0: tick = 0
+        if tick > (L-1): tick = L-1
+        # FK
+        q = q_list[tick,:] # [35]
+        p_root = p_root_list[tick,:] # [3]
+        quat_root = quat_root_list[tick,:] # [4] quaternion
+        env.set_p_root(root_name='base',p=p_root)
+        env.set_quat_root(root_name='base',quat=quat_root)
+        env.forward(q=q,joint_idxs=joint_idxs_fwd)
+        # Render
+        if env.loop_every(tick_every=100) or tick_slider.PLAYBACK:
+            # Plot world frame
+            env.plot_T(p=np.zeros(3),R=np.eye(3,3),
+                       PLOT_AXIS=True,axis_len=0.5,axis_width=0.005)
+            env.plot_T(p=np.array([0,0,0.5]),R=np.eye(3,3),
+                       PLOT_AXIS=False,label="tick:[%d]"%(tick))
+            # Plot geometries
+            env.plot_geom_T(geom_name='rfoot',axis_len=0.3)
+            env.plot_geom_T(geom_name='lfoot',axis_len=0.3)
+            # Plot revolute joints with arrow
+            env.plot_joint_axis(axis_len=0.1,axis_r=0.01)    
+            env.render()
+            
+    # Close MuJoCo viewer
+    env.close_viewer()
+
+def feet_anchoring(env,q_list,quat_root_list,p_root_list,rev_joint_names,
+                   foot_thickness=0.04,p_cfoot_offset=np.array([0,0,0.02]),d_rf2lf_custom=0.3,
+                   ik_th=1e-3,ik_iters=5000,ANIMATE_IK=True):
+    """ 
+        Feet anchoring
+    """
+    # Get useful indices
+    joint_idxs_fwd = env.get_idxs_fwd(joint_names=rev_joint_names)
+    joint_idxs_jac = env.get_idxs_jac(joint_names=rev_joint_names)
+    
+    # Initialize viewer
+    if ANIMATE_IK:
+        env.init_viewer(viewer_title='Common Rig',viewer_width=1200,viewer_height=800,
+                        viewer_hide_menus=True,FONTSCALE_VALUE=200)
+        env.update_viewer(azimuth=152,distance=3.0,elevation=-30,lookat=[0.02,-0.03,0.8])
+    env.reset()
+
+    # First, get two feet trajectories
+    L = q_list.shape[0]
+    p_rfoot_list = np.zeros((L,3))
+    p_lfoot_list = np.zeros((L,3))
+    for tick in range(L):
+        # Update skeleton pose
+        q = q_list[tick,:] # [35]
+        p_root = p_root_list[tick,:] # [3]
+        quat_root = quat_root_list[tick,:] # [4] quaternion
+        env.set_p_root(root_name='base',p=p_root)
+        env.set_quat_root(root_name='base',quat=quat_root)
+        env.forward(q=q,joint_idxs=joint_idxs_fwd)
+        # Append two feet positions
+        p_rfoot_list[tick,:] = env.get_p_geom(geom_name='rfoot')
+        p_lfoot_list[tick,:] = env.get_p_geom(geom_name='lfoot')
+
+    # Modify the root position so that the center of two feet is in the origin
+    p_root_centered_list = np.zeros((L,3))
+    p_rfoot_centered_list = np.zeros((L,3))
+    p_lfoot_centered_list = np.zeros((L,3))
+    for tick in range(L):
+        # Get current pose
+        q = q_list[tick,:] # [35]
+        p_root = p_root_list[tick,:]
+        quat_root = quat_root_list[tick,:] # [4] quaternion
+        # Move the body so that the feet is in the origin
+        p_cfoot = 0.5*(p_rfoot_list[tick,:]+p_lfoot_list[tick,:])
+        p_root_centered = p_root-p_cfoot+np.array([0,0,foot_thickness/2])
+        p_root_centered_list[tick,:] = p_root_centered
+        env.set_p_root(root_name='base',p=p_root_centered)
+        env.set_quat_root(root_name='base',quat=quat_root)
+        env.forward(q=q,joint_idxs=joint_idxs_fwd)
+        # Append centered feet trajectories
+        p_rfoot_centered_list[tick,:] = env.get_p_geom(geom_name='rfoot')
+        p_lfoot_centered_list[tick,:] = env.get_p_geom(geom_name='lfoot')
         
+    # Solve IK to anchor two feet
+    p_trgt_rfoot = np.average(p_rfoot_centered_list,axis=0) # [3]
+    p_trgt_lfoot = np.average(p_lfoot_centered_list,axis=0) # [3]
+    p_cfoot = 0.5*(p_trgt_rfoot+p_trgt_lfoot)
+    d_rf2lf = np.linalg.norm(p_trgt_rfoot-p_trgt_lfoot) # distance between feet
+
+    # Modify feet target
+    p_cfoot = p_cfoot + p_cfoot_offset
+    if d_rf2lf_custom is not None:
+        d_rf2lf = d_rf2lf_custom
+    p_trgt_rfoot = p_cfoot - 0.5*d_rf2lf*np.array([0,1,0])
+    p_trgt_lfoot = p_cfoot + 0.5*d_rf2lf*np.array([0,1,0])
+
+    # Feet rotation target
+    R_trgt_rfoot = rpy2r(np.radians([0,0,0]))
+    R_trgt_lfoot = rpy2r(np.radians([0,0,0]))
+    q_feetanchor_list = np.zeros((L,len(rev_joint_names)))
+    for tick in range(L):
+        p_root_centered = p_root_centered_list[tick,:]
+        quat_root = quat_root_list[tick,:]
+        q = q_list[tick,:] # [35]
+        env.set_p_root(root_name='base',p=p_root_centered)
+        env.set_quat_root(root_name='base',quat=quat_root)
+        env.forward(q=q,joint_idxs=joint_idxs_fwd)
+        # Solve IK
+        ik_geom_names = ['rfoot','lfoot']
+        ik_p_trgts = [p_trgt_rfoot,p_trgt_lfoot]
+        ik_R_trgts = [R_trgt_rfoot,R_trgt_lfoot]
+        err_traj = np.zeros(ik_iters)
+        for ik_tick in range(ik_iters):
+            J_list,ik_err_list = [],[]
+            for ik_idx,ik_geom_name in enumerate(ik_geom_names):
+                ik_p_trgt = ik_p_trgts[ik_idx]
+                ik_R_trgt = ik_R_trgts[ik_idx]
+                IK_P = ik_p_trgt is not None
+                IK_R = ik_R_trgt is not None
+                J,ik_err = env.get_ik_ingredients_geom(
+                    geom_name=ik_geom_name,p_trgt=ik_p_trgt,R_trgt=ik_R_trgt,
+                    IK_P=IK_P,IK_R=IK_R)
+                J_list.append(J)
+                ik_err_list.append(ik_err)
+            J_stack      = np.vstack(J_list)
+            ik_err_stack = np.hstack(ik_err_list)
+            ik_err_norm = np.linalg.norm(ik_err_stack)
+            err_traj[ik_tick] = ik_err_norm
+            dq = env.damped_ls(J_stack,ik_err_stack,stepsize=1,eps=1e-3,th=np.radians(10.0))
+            q = q + dq[joint_idxs_jac]
+            env.forward(q=q,joint_idxs=joint_idxs_fwd)
+            # Early terminate
+            if ik_err_norm < ik_th: break
+            # Error
+            if ik_tick == (ik_iters-1):
+                print ("[feet_anchoring] ik_tick:[%d] ik_err_norm:[%.3f] is above threshold:[%.3f]"%
+                       (ik_tick,ik_err_norm,ik_th))
+            
+        # Append q
+        q_feetanchor_list[tick,:] = env.get_qpos_joints(rev_joint_names)
+        
+        # IK Debug plot
+        if ANIMATE_IK:
+            env.plot_T(p=np.zeros(3),R=np.eye(3,3),
+                    PLOT_AXIS=True,axis_len=0.5,axis_width=0.01)
+            env.plot_T(p=np.array([0,0,0.5]),R=np.eye(3,3),
+                    PLOT_AXIS=False,label="tick:[%d/%d]"%(tick,L))
+            env.plot_ik_geom_info(
+                ik_geom_names,ik_p_trgts,ik_R_trgts,axis_len=0.2,axis_width=0.01,sphere_r=0.1)
+            env.render()
+        
+    # Close MuJoCo viewer
+    if ANIMATE_IK:
+        env.close_viewer()
+    
+    # Return
+    feet_anchor_res = {
+        'L':L,
+        'p_root_centered_list':p_root_centered_list,
+        'q_feetanchor_list':q_feetanchor_list}
+    return feet_anchor_res
+
+def blend_tween_trajectories(
+    time_blend_list,intv_fade,
+    time_a_list,x_a_list,time_b_list,x_b_list,
+    time_tween_list,x_tween_list):
+    """ 
+        Blen trajectory a, trajectory b, and tweened trajectory
+    """
+    # Buffers to save blended results
+    dim_x        = x_a_list.shape[1]
+    n_blend      = time_blend_list.shape[0]
+    x_blend_list = np.zeros((n_blend,dim_x))
+    
+    # Append
+    time_ab_list = np.concatenate((time_a_list,time_b_list))
+    x_ab_list    = np.vstack((x_a_list,x_b_list))
+    
+    # Initialize 'x_blend_list' with nearest interpolation of 'x_ab_list'
+    for d_idx in range(dim_x):
+        for tick in range(len(time_blend_list)):
+            time_curr = time_blend_list[tick]
+            idx_min = np.argmin(np.abs(time_ab_list-time_curr))
+            x_blend_list[tick,d_idx] = x_ab_list[idx_min,d_idx]
+            
+    # Blend trajectories
+    for d_idx in range(dim_x):
+        
+        # First blending (centered at the end of motion a)
+        time_center = time_a_list[-1]
+        time_min    = time_center - intv_fade
+        time_max    = time_center + intv_fade
+        for tick in range(n_blend):
+            time_curr = time_blend_list[tick]
+            if (time_min < time_curr) and (time_curr <= time_max):
+                alpha = (time_curr-time_min)/(time_max-time_min)
+                idx_a = np.argmin(np.abs(time_a_list-time_curr))
+                idx_tween = np.argmin(np.abs(time_tween_list-time_curr))
+                # Update
+                x_blend_list[tick,d_idx] = (1-alpha)*x_a_list[idx_a,d_idx] + \
+                    alpha*x_tween_list[idx_tween,d_idx]
+                
+        # Second blending (centered at the start of motion b)
+        time_center = time_b_list[0]
+        time_min    = time_center - intv_fade
+        time_max    = time_center + intv_fade
+        for tick in range(n_blend):
+            time_curr = time_blend_list[tick]
+            if (time_min < time_curr) and (time_curr <= time_max):
+                alpha = (time_curr-time_min)/(time_max-time_min)
+                idx_b = np.argmin(np.abs(time_b_list-time_curr))
+                idx_tween = np.argmin(np.abs(time_tween_list-time_curr))
+                # Update
+                x_blend_list[tick,d_idx] = alpha*x_b_list[idx_b,d_idx] + \
+                    (1-alpha)*x_tween_list[idx_tween,d_idx]
+                
+        # Third blending (nearest filtering between the end of a and the start of b)
+        for tick in range(n_blend):
+            time_curr = time_blend_list[tick]
+            if ((time_a_list[-1]+intv_fade) < time_curr) and (time_curr <= (time_b_list[0]-intv_fade)):
+                idx_tween = np.argmin(np.abs(time_tween_list-time_curr))
+                # Update
+                x_blend_list[tick,d_idx] = x_tween_list[idx_tween,d_idx]
+
+    # Return
+    return x_blend_list
+
+def get_gp_mean_function(time_in_list,x_in_list,time_out_list,
+                         hyp={'g':1.0,'l':1.0},sig2w=1e-8):
+    """ 
+        Gaussian process mean
+    """
+    n_in,n_out  = time_in_list.shape[0],time_out_list.shape[0]
+    K_in        = kernel_se(time_in_list,time_in_list,hyp=hyp)
+    K_tween_in  = kernel_se(time_out_list,time_in_list,hyp=hyp)
+    inv_K_ab    = np.linalg.inv(K_in+sig2w*np.eye(n_in))
+    mu_x_in     = np.mean(x_in_list,axis=0)
+    x_out_list  = K_tween_in @ inv_K_ab @ (x_in_list-mu_x_in) + mu_x_in # GP result
+    return x_out_list
+    
+def animate_motion_with_media(env,p_root_list,quat_root_list,q_list,rev_joint_names,HZ,
+                              viewer_distance=3.0):
+    """
+        Animate motion with media.show_video
+    """
+    # Initialize viewer
+    L              = q_list.shape[0]
+    joint_idxs_fwd = env.get_idxs_fwd(joint_names=rev_joint_names)
+    env.init_viewer(viewer_title='Common Rig',viewer_width=1200,viewer_height=800,
+                    viewer_hide_menus=True,FONTSCALE_VALUE=200)
+    env.update_viewer(azimuth=152,distance=viewer_distance,elevation=-30,lookat=[0.02,-0.03,0.8])
+    env.reset()
+    img_list = []
+    for tick in range(L):
+        # FK
+        q         = q_list[tick,:] # [35]
+        p_root    = p_root_list[tick,:] # [3]
+        quat_root = quat_root_list[tick,:] # [4] quaternion
+        env.set_p_root(root_name='base',p=p_root)
+        env.set_quat_root(root_name='base',quat=quat_root)
+        env.forward(q=q,joint_idxs=joint_idxs_fwd)
+        # Render
+        env.plot_T(p=np.zeros(3),R=np.eye(3,3),
+                PLOT_AXIS=True,axis_len=0.5,axis_width=0.005)
+        env.plot_T(p=np.array([0,0,0.5]),R=np.eye(3,3),
+                PLOT_AXIS=False,label="tick:[%d]"%(tick))
+        env.plot_geom_T(geom_name='rfoot',axis_len=0.3)
+        env.plot_geom_T(geom_name='lfoot',axis_len=0.3)
+        env.plot_joint_axis(axis_len=0.1,axis_r=0.01)    
+        env.render()
+        # Append image
+        img = env.grab_image()
+        img_list.append(img)
+    # Close MuJoCo viewer
+    env.close_viewer()
+    # Make video
+    media.show_video(img_list,fps=HZ)
