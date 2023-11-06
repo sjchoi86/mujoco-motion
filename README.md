@@ -1,1 +1,1 @@
-# mujoco-motion
+# mujoco-motion (deprecated)
